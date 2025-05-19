@@ -32,55 +32,102 @@ export default function CaptureForm() {
 
   const [hasCameraPermissionInternal, setHasCameraPermissionInternal] = useState<boolean | null>(null);
 
-  const setupCamera = useCallback(async () => {
-    if (uiMode === 'upload_mode' || uiMode === 'results' || uiMode === 'analyzing') {
-        return;
-    }
-    if (hasCameraPermissionInternal === true && videoRef.current?.srcObject) {
-      setUiMode('camera_active');
-      return;
-    }
-    setUiMode('camera_pending');
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        videoRef.current.onloadedmetadata = () => { // Ensure video is ready before setting active
-          setUiMode('camera_active');
-        };
-      } else {
-         // If videoRef is not available yet, this might be too early. Consider a retry or different state.
-         setUiMode('camera_denied'); // Fallback if videoRef is not there
-      }
-      setHasCameraPermissionInternal(true);
-    } catch (error) {
-      console.error('Error accessing camera:', error);
-      setHasCameraPermissionInternal(false);
-      setUiMode('camera_denied');
-      toast({
-        variant: 'destructive',
-        title: 'Camera Access Denied',
-        description: 'Please enable camera permissions or use file upload.',
-      });
-    }
-  }, [toast, hasCameraPermissionInternal, uiMode]);
-
   useEffect(() => {
-    if ( uiMode !== 'upload_mode' &&
-         uiMode !== 'results' &&
-         uiMode !== 'analyzing' &&
-         !imagePreview &&            
-         !analysisResult) {
-      setupCamera();
-    }
+    let isEffectMounted = true;
+    let streamInstance: MediaStream | null = null;
+
+    const manageCameraAsync = async () => {
+      const shouldHaveCamera =
+        uiMode !== 'upload_mode' &&
+        uiMode !== 'results' &&
+        uiMode !== 'analyzing' &&
+        !imagePreview &&
+        !analysisResult;
+
+      // Condition to not attempt if already hard-denied (hasCameraPermissionInternal is false) 
+      // AND we are in 'camera_denied' mode (meaning this isn't an attempt to retry via 'startOver' which sets permission to null)
+      const explicitlyDeniedAndNotRetrying = hasCameraPermissionInternal === false && uiMode === 'camera_denied';
+
+      if (!shouldHaveCamera || explicitlyDeniedAndNotRetrying) {
+        if (videoRef.current?.srcObject) {
+          (videoRef.current.srcObject as MediaStream).getTracks().forEach(track => track.stop());
+          videoRef.current.srcObject = null;
+        }
+        streamInstance = null; // Ensure tracked instance is also cleared
+        return; 
+      }
+
+      // If camera is already active, stream is present, and permission is true, nothing to do.
+      if (uiMode === 'camera_active' && videoRef.current?.srcObject && hasCameraPermissionInternal === true) {
+        streamInstance = videoRef.current.srcObject as MediaStream;
+        return;
+      }
+      
+      // Transition to pending state if we are about to attempt camera setup.
+      // Avoid setting to pending if already denied and permission is definitively false (covered by explicitlyDeniedAndNotRetrying).
+      // Or if already active but stream just got lost (will be handled by trying to get stream again).
+      if (uiMode !== 'camera_pending' && !(uiMode === 'camera_denied' && hasCameraPermissionInternal === false)) {
+        setUiMode('camera_pending');
+      }
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+        if (!isEffectMounted) { 
+          stream.getTracks().forEach(track => track.stop());
+          return;
+        }
+        streamInstance = stream;
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          // Wait for metadata to load before declaring camera active, prevents issues with premature snaps
+          videoRef.current.onloadedmetadata = () => {
+            if (isEffectMounted) {
+                 // Only switch to active if still in a relevant pending/denied_retry state
+                setUiMode(currentMode => 
+                    (currentMode === 'camera_pending' || (currentMode === 'camera_denied' && hasCameraPermissionInternal !== false)) 
+                    ? 'camera_active' 
+                    : currentMode
+                );
+            }
+          };
+           videoRef.current.onerror = () => { // Handle potential video errors
+            if (isEffectMounted) {
+                setUiMode('camera_denied');
+                setHasCameraPermissionInternal(false); // Assume error means permission issue or hardware problem
+            }
+           }
+        } else { 
+          stream.getTracks().forEach(track => track.stop());
+          streamInstance = null;
+          if (isEffectMounted) setUiMode('camera_denied');
+        }
+        if (isEffectMounted) setHasCameraPermissionInternal(true);
+      } catch (error) {
+        console.error('Error accessing camera:', error);
+        if (isEffectMounted) {
+          setHasCameraPermissionInternal(false);
+          setUiMode('camera_denied');
+           toast({ // Toast on explicit denial/error during setup
+            variant: 'destructive',
+            title: 'Camera Access Denied',
+            description: 'Please enable camera permissions or use file upload.',
+          });
+        }
+      }
+    };
+
+    manageCameraAsync();
+
     return () => {
-      if (videoRef.current && videoRef.current.srcObject) {
-        const stream = videoRef.current.srcObject as MediaStream;
-        stream.getTracks().forEach(track => track.stop());
+      isEffectMounted = false;
+      if (streamInstance) {
+        streamInstance.getTracks().forEach(track => track.stop());
+      } else if (videoRef.current?.srcObject) {
+        (videoRef.current.srcObject as MediaStream).getTracks().forEach(track => track.stop());
         videoRef.current.srcObject = null;
       }
     };
-  }, [uiMode, imagePreview, analysisResult, setupCamera]);
+  }, [uiMode, imagePreview, analysisResult, hasCameraPermissionInternal, toast]);
 
 
   const runAnalysis = useCallback(async (imageDataUri: string) => {
@@ -88,6 +135,13 @@ export default function CaptureForm() {
     setUiMode('analyzing');
     setAnalysisError(null);
     
+    // Stop camera stream if it was active before analysis
+    if (modeBeforeAnalysis === 'camera_active' && videoRef.current?.srcObject) {
+        const stream = videoRef.current.srcObject as MediaStream;
+        stream.getTracks().forEach(track => track.stop());
+        videoRef.current.srcObject = null;
+    }
+
     try {
       const result: AnalyzePsleProblemOutput = await analyzePsleProblem({ problemImage: imageDataUri });
       const newAnalyzedProblem: AnalyzedProblem = {
@@ -110,14 +164,13 @@ export default function CaptureForm() {
       console.error("Analysis failed:", err);
       const errorMessage = err instanceof Error ? err.message : "An unknown error occurred during analysis.";
       setAnalysisError(errorMessage);
-
-      if (modeBeforeAnalysis === 'camera_active' || modeBeforeAnalysis === 'upload_mode') {
-        setUiMode(modeBeforeAnalysis);
+      
+      // Revert to a state that shows the image preview if available, otherwise upload mode.
+      // This ensures the user sees the image they tried to analyze.
+      if (imagePreview) {
+        setUiMode('upload_mode'); // upload_mode will show the imagePreview if it exists
       } else {
-        // Fallback if modeBeforeAnalysis was something unexpected (e.g., 'camera_pending')
-        // If imagePreview exists, show it in context of upload_mode (which will then show the preview section)
-        // otherwise, default to upload_mode to allow user to try again.
-        setUiMode(imagePreview ? 'upload_mode' : 'upload_mode'); 
+        setUiMode(modeBeforeAnalysis === 'camera_active' ? 'camera_denied' : 'upload_mode'); // Fallback if no preview
       }
       
       setShouldAutoPlaySpeech(false); 
@@ -127,15 +180,15 @@ export default function CaptureForm() {
         variant: "destructive",
       });
     }
-  }, [toast, imagePreview, uiMode]); // Added uiMode and imagePreview as dependencies
+  }, [toast, imagePreview, uiMode]); // Added uiMode
 
   const handleSnapAnalyzeAndRead = async () => {
-    if (videoRef.current && canvasRef.current && hasCameraPermissionInternal) {
+    if (videoRef.current && canvasRef.current && uiMode === 'camera_active' && hasCameraPermissionInternal) {
       const video = videoRef.current;
       const canvas = canvasRef.current;
 
       if (video.readyState < video.HAVE_METADATA || video.videoWidth === 0 || video.videoHeight === 0) {
-        toast({ title: "Camera Not Ready", description: "Video stream has not loaded. Please wait and try again." });
+        toast({ title: "Camera Not Ready", description: "Video stream has not loaded or is not providing dimensions. Please wait and try again." });
         return;
       }
 
@@ -145,13 +198,7 @@ export default function CaptureForm() {
       if (context) {
         context.drawImage(video, 0, 0, canvas.width, canvas.height);
         const dataUrl = canvas.toDataURL('image/png');
-        setImagePreview(dataUrl);
-
-        if (videoRef.current && videoRef.current.srcObject) {
-            const stream = videoRef.current.srcObject as MediaStream;
-            stream.getTracks().forEach(track => track.stop());
-            videoRef.current.srcObject = null;
-        }
+        setImagePreview(dataUrl); // This will trigger useEffect to stop the camera via shouldHaveCamera condition
 
         fetch(dataUrl).then(res => res.blob()).then(blob => {
           setImageFile(new File([blob], "webcam-photo.png", { type: "image/png" }));
@@ -161,7 +208,7 @@ export default function CaptureForm() {
         runAnalysis(dataUrl);
       }
     } else {
-      toast({ title: "Capture Error", description: "Unable to snap photo.", variant: "destructive" });
+      toast({ title: "Capture Error", description: "Unable to snap photo. Camera might not be active or permission denied.", variant: "destructive" });
     }
   };
 
@@ -172,14 +219,14 @@ export default function CaptureForm() {
       const reader = new FileReader();
       reader.onloadend = () => {
         const dataUrl = reader.result as string;
-        setImagePreview(dataUrl);
-        setShouldAutoPlaySpeech(false);
+        setImagePreview(dataUrl); // This will trigger useEffect to stop camera if it was running
+        setShouldAutoPlaySpeech(false); // Don't auto-read for uploads unless specified
         runAnalysis(dataUrl);
       };
       reader.readAsDataURL(file);
     }
     if (fileInputRef.current) {
-        fileInputRef.current.value = "";
+        fileInputRef.current.value = ""; // Reset file input
     }
   };
 
@@ -189,19 +236,15 @@ export default function CaptureForm() {
     setImageFile(null);
     setAnalysisError(null);
     setShouldAutoPlaySpeech(false);
-    setHasCameraPermissionInternal(null); 
-    setUiMode('camera_pending'); // Explicitly set to camera_pending to trigger setupCamera via useEffect
-    // setupCamera(); // This will be triggered by useEffect due to uiMode and other state changes
+    setHasCameraPermissionInternal(null); // Reset permission to allow re-prompt by useEffect
+    setUiMode('camera_pending'); // Trigger camera setup via useEffect
   };
 
   const switchToUploadMode = () => {
-    if (videoRef.current && videoRef.current.srcObject) {
-        const stream = videoRef.current.srcObject as MediaStream;
-        stream.getTracks().forEach(track => track.stop());
-        videoRef.current.srcObject = null;
-    }
-    setHasCameraPermissionInternal(false); 
+    // Setting uiMode to 'upload_mode' will cause useEffect to stop the camera stream.
     setUiMode('upload_mode');
+    // No need to manually stop stream here, useEffect handles it.
+    // No need to set hasCameraPermissionInternal to false, retain its actual state.
   };
 
 
@@ -244,10 +287,11 @@ export default function CaptureForm() {
         </Alert>
       )}
       
-      {(uiMode === 'camera_pending' || uiMode === 'camera_active' || (uiMode === 'camera_denied' && hasCameraPermissionInternal === null) ) && !imagePreview && (
+      {/* Camera View Section: Shown if not in results/analyzing and no imagePreview exists (unless uiMode forced upload) */}
+      {(uiMode === 'camera_pending' || uiMode === 'camera_active' || (uiMode === 'camera_denied' && hasCameraPermissionInternal !== false)) && !imagePreview && (
          <div className="space-y-4 p-6 border rounded-lg shadow-sm bg-card">
             <h3 className="text-lg font-semibold text-center text-foreground">Webcam Capture</h3>
-            {uiMode === 'camera_pending' && (
+            {uiMode === 'camera_pending' && hasCameraPermissionInternal !== false && (
                 <Alert variant="default" className="shadow-md">
                     <AlertCircle className="h-5 w-5" />
                     <AlertTitle>Initializing Camera</AlertTitle>
@@ -259,10 +303,11 @@ export default function CaptureForm() {
              <div className={`relative aspect-video w-full max-w-md mx-auto overflow-hidden rounded-lg border shadow-md bg-muted ${uiMode !== 'camera_active' ? 'flex items-center justify-center min-h-[200px]' : ''}`}>
                 <video ref={videoRef} className={`w-full h-full object-contain ${uiMode !== 'camera_active' ? 'hidden' : ''}`} autoPlay muted playsInline />
                 {uiMode === 'camera_pending' && <CameraIcon className="h-16 w-16 text-muted-foreground animate-pulse" />}
-                {uiMode === 'camera_denied' && hasCameraPermissionInternal === false && !videoRef.current?.srcObject && (
-                   <div className="flex flex-col items-center justify-center text-muted-foreground p-4">
+                {uiMode === 'camera_denied' && ( // Show this if denied or error occurred
+                   <div className="flex flex-col items-center justify-center text-muted-foreground p-4 text-center">
                      <Video className="h-16 w-16 mb-2" />
-                     <p>Camera access denied or unavailable.</p>
+                     <p>Camera access denied, unavailable, or an error occurred.</p>
+                     {hasCameraPermissionInternal === null && <p className="text-xs">Attempting to initialize...</p>}
                    </div>
                 )}
              </div>
@@ -279,7 +324,8 @@ export default function CaptureForm() {
          </div>
       )}
 
-      {(uiMode === 'upload_mode' || (uiMode === 'camera_denied' && hasCameraPermissionInternal === false)) && !imagePreview && (
+      {/* Upload Section: Shown if uiMode is 'upload_mode', OR if camera is denied and no imagePreview */}
+      {(uiMode === 'upload_mode' || (uiMode === 'camera_denied' && hasCameraPermissionInternal === false && !imagePreview)) && !imagePreview && (
         <div className="space-y-4 p-6 border border-dashed rounded-lg shadow-sm bg-card">
             {uiMode === 'camera_denied' && hasCameraPermissionInternal === false && (
                  <Alert variant="destructive" className="shadow-md">
@@ -305,7 +351,8 @@ export default function CaptureForm() {
           <p id="image-help-text" className="text-xs text-muted-foreground text-center">
             Select a clear picture of the exam problem. Analysis will start automatically.
           </p>
-          {hasCameraPermissionInternal !== true && ( 
+          {/* Allow retrying camera if it was denied or never successfully permitted */}
+          {(hasCameraPermissionInternal === false || hasCameraPermissionInternal === null) && ( 
             <Button onClick={handleStartOver} variant="outline" size="sm" className="w-full">
                 <CameraIcon className="mr-2 h-4 w-4" /> Try Webcam Again
             </Button>
@@ -313,8 +360,9 @@ export default function CaptureForm() {
         </div>
       )}
 
+      {/* Image Preview Section: Shown if an imagePreview exists and not in results/analyzing (typically after upload or if analysis failed) */}
       {imagePreview && uiMode !== 'results' && uiMode !== 'analyzing' && (
-         <div className="space-y-4">
+         <div className="space-y-4 p-6 border rounded-lg shadow-sm bg-card">
           <h3 className="text-lg font-semibold text-center text-foreground">Selected Image</h3>
           <div className="relative aspect-video w-full max-w-md mx-auto overflow-hidden rounded-lg border shadow-md">
             <Image src={imagePreview} alt="Problem preview" layout="fill" objectFit="contain" data-ai-hint="exam problem" />
@@ -328,5 +376,3 @@ export default function CaptureForm() {
     </div>
   );
 }
-
-    
