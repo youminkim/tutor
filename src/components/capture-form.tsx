@@ -19,8 +19,8 @@ type UiMode = 'camera_pending' | 'camera_active' | 'camera_denied' | 'upload_mod
 
 export default function CaptureForm() {
   const [uiMode, setUiMode] = useState<UiMode>('camera_pending');
-  const [imageFile, setImageFile] = useState<File | null>(null); // For potential direct use, though dataURI is primary
-  const [imagePreview, setImagePreview] = useState<string | null>(null); // Data URI
+  const [imageFile, setImageFile] = useState<File | null>(null); 
+  const [imagePreview, setImagePreview] = useState<string | null>(null); 
   const [analysisResult, setAnalysisResult] = useState<AnalyzedProblem | null>(null);
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [shouldAutoPlaySpeech, setShouldAutoPlaySpeech] = useState<boolean>(false);
@@ -32,10 +32,11 @@ export default function CaptureForm() {
 
   const [hasCameraPermissionInternal, setHasCameraPermissionInternal] = useState<boolean | null>(null);
 
-  // Request camera permission and set up stream
   const setupCamera = useCallback(async () => {
+    if (uiMode === 'upload_mode' || uiMode === 'results' || uiMode === 'analyzing') {
+        return;
+    }
     if (hasCameraPermissionInternal === true && videoRef.current?.srcObject) {
-      // Camera already set up and permission granted
       setUiMode('camera_active');
       return;
     }
@@ -44,9 +45,14 @@ export default function CaptureForm() {
       const stream = await navigator.mediaDevices.getUserMedia({ video: true });
       if (videoRef.current) {
         videoRef.current.srcObject = stream;
+        videoRef.current.onloadedmetadata = () => { // Ensure video is ready before setting active
+          setUiMode('camera_active');
+        };
+      } else {
+         // If videoRef is not available yet, this might be too early. Consider a retry or different state.
+         setUiMode('camera_denied'); // Fallback if videoRef is not there
       }
       setHasCameraPermissionInternal(true);
-      setUiMode('camera_active');
     } catch (error) {
       console.error('Error accessing camera:', error);
       setHasCameraPermissionInternal(false);
@@ -57,14 +63,16 @@ export default function CaptureForm() {
         description: 'Please enable camera permissions or use file upload.',
       });
     }
-  }, [toast, hasCameraPermissionInternal]);
+  }, [toast, hasCameraPermissionInternal, uiMode]);
 
   useEffect(() => {
-    // Attempt to set up camera on initial mount if no analysis result exists
-    if (!analysisResult && !imagePreview) {
+    if ( uiMode !== 'upload_mode' &&
+         uiMode !== 'results' &&
+         uiMode !== 'analyzing' &&
+         !imagePreview &&            
+         !analysisResult) {
       setupCamera();
     }
-    // Cleanup stream on unmount
     return () => {
       if (videoRef.current && videoRef.current.srcObject) {
         const stream = videoRef.current.srcObject as MediaStream;
@@ -72,13 +80,13 @@ export default function CaptureForm() {
         videoRef.current.srcObject = null;
       }
     };
-  }, [setupCamera, analysisResult, imagePreview]);
+  }, [uiMode, imagePreview, analysisResult, setupCamera]);
 
 
   const runAnalysis = useCallback(async (imageDataUri: string) => {
+    const modeBeforeAnalysis = uiMode;
     setUiMode('analyzing');
     setAnalysisError(null);
-    // analysisResult is cleared by handleStartOver or before new analysis
     
     try {
       const result: AnalyzePsleProblemOutput = await analyzePsleProblem({ problemImage: imageDataUri });
@@ -102,17 +110,24 @@ export default function CaptureForm() {
       console.error("Analysis failed:", err);
       const errorMessage = err instanceof Error ? err.message : "An unknown error occurred during analysis.";
       setAnalysisError(errorMessage);
-      setUiMode(imagePreview ? 'camera_active' : 'upload_mode'); // Go back to appropriate mode before analysis
-      // If imagePreview exists, it means we were likely in camera_active or had an upload.
-      // If no imagePreview, means upload failed early or something unexpected.
-      setShouldAutoPlaySpeech(false); // Don't autoplay if analysis failed
+
+      if (modeBeforeAnalysis === 'camera_active' || modeBeforeAnalysis === 'upload_mode') {
+        setUiMode(modeBeforeAnalysis);
+      } else {
+        // Fallback if modeBeforeAnalysis was something unexpected (e.g., 'camera_pending')
+        // If imagePreview exists, show it in context of upload_mode (which will then show the preview section)
+        // otherwise, default to upload_mode to allow user to try again.
+        setUiMode(imagePreview ? 'upload_mode' : 'upload_mode'); 
+      }
+      
+      setShouldAutoPlaySpeech(false); 
       toast({
         title: "Analysis Failed",
         description: errorMessage,
         variant: "destructive",
       });
     }
-  }, [toast]);
+  }, [toast, imagePreview, uiMode]); // Added uiMode and imagePreview as dependencies
 
   const handleSnapAnalyzeAndRead = async () => {
     if (videoRef.current && canvasRef.current && hasCameraPermissionInternal) {
@@ -132,7 +147,6 @@ export default function CaptureForm() {
         const dataUrl = canvas.toDataURL('image/png');
         setImagePreview(dataUrl);
 
-        // Stop camera stream after taking photo
         if (videoRef.current && videoRef.current.srcObject) {
             const stream = videoRef.current.srcObject as MediaStream;
             stream.getTracks().forEach(track => track.stop());
@@ -164,7 +178,6 @@ export default function CaptureForm() {
       };
       reader.readAsDataURL(file);
     }
-     // Reset file input to allow uploading the same file again
     if (fileInputRef.current) {
         fileInputRef.current.value = "";
     }
@@ -176,9 +189,9 @@ export default function CaptureForm() {
     setImageFile(null);
     setAnalysisError(null);
     setShouldAutoPlaySpeech(false);
-    setHasCameraPermissionInternal(null); // This will trigger setupCamera via useEffect dependency if needed
-    // Explicitly call setupCamera to re-initiate camera attempt
-    setupCamera(); // This will set uiMode to camera_pending then active/denied
+    setHasCameraPermissionInternal(null); 
+    setUiMode('camera_pending'); // Explicitly set to camera_pending to trigger setupCamera via useEffect
+    // setupCamera(); // This will be triggered by useEffect due to uiMode and other state changes
   };
 
   const switchToUploadMode = () => {
@@ -187,7 +200,7 @@ export default function CaptureForm() {
         stream.getTracks().forEach(track => track.stop());
         videoRef.current.srcObject = null;
     }
-    setHasCameraPermissionInternal(false); // Effectively marks camera as not the go-to
+    setHasCameraPermissionInternal(false); 
     setUiMode('upload_mode');
   };
 
@@ -246,6 +259,12 @@ export default function CaptureForm() {
              <div className={`relative aspect-video w-full max-w-md mx-auto overflow-hidden rounded-lg border shadow-md bg-muted ${uiMode !== 'camera_active' ? 'flex items-center justify-center min-h-[200px]' : ''}`}>
                 <video ref={videoRef} className={`w-full h-full object-contain ${uiMode !== 'camera_active' ? 'hidden' : ''}`} autoPlay muted playsInline />
                 {uiMode === 'camera_pending' && <CameraIcon className="h-16 w-16 text-muted-foreground animate-pulse" />}
+                {uiMode === 'camera_denied' && hasCameraPermissionInternal === false && !videoRef.current?.srcObject && (
+                   <div className="flex flex-col items-center justify-center text-muted-foreground p-4">
+                     <Video className="h-16 w-16 mb-2" />
+                     <p>Camera access denied or unavailable.</p>
+                   </div>
+                )}
              </div>
 
             {uiMode === 'camera_active' && hasCameraPermissionInternal && (
@@ -286,7 +305,7 @@ export default function CaptureForm() {
           <p id="image-help-text" className="text-xs text-muted-foreground text-center">
             Select a clear picture of the exam problem. Analysis will start automatically.
           </p>
-          {hasCameraPermissionInternal !== true && ( // Show option to try camera if not actively denied this session or if permission unknown
+          {hasCameraPermissionInternal !== true && ( 
             <Button onClick={handleStartOver} variant="outline" size="sm" className="w-full">
                 <CameraIcon className="mr-2 h-4 w-4" /> Try Webcam Again
             </Button>
@@ -294,12 +313,6 @@ export default function CaptureForm() {
         </div>
       )}
 
-      {/* This image preview is mostly for when analysis is triggered and we want to show what's being analyzed,
-          or if analysis fails and user sees what they submitted.
-          The main display logic is handled by uiMode now.
-          This block might be redundant if 'analyzing' and 'results' views handle their own previews.
-          Let's keep it for debugging or potential brief display between states.
-      */}
       {imagePreview && uiMode !== 'results' && uiMode !== 'analyzing' && (
          <div className="space-y-4">
           <h3 className="text-lg font-semibold text-center text-foreground">Selected Image</h3>
@@ -315,3 +328,5 @@ export default function CaptureForm() {
     </div>
   );
 }
+
+    
