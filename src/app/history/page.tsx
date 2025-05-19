@@ -1,15 +1,15 @@
-import CaptureForm from "@/components/capture-form";
+import HistoryList from "@/components/history-list";
 
-export default function HomePage() {
+export default function HistoryPage() {
   return (
     <div className="flex flex-col items-center justify-start min-h-full py-2">
       <h1 className="text-3xl font-bold text-center text-primary mb-2">
-        Snap & Solve
+        Study History
       </h1>
       <p className="text-center text-muted-foreground mb-8 max-w-md">
-        Capture an exam problem, and let our AI tutor provide expert guidance and identify key concepts for you.
+        Review your past analyzed problems and reinforce your learning.
       </p>
-      <CaptureForm />
+      <HistoryList />
     </div>
   );
 }
