@@ -1,7 +1,7 @@
 
 "use client";
 
-import { useState, type ChangeEvent, useRef, useEffect } from 'react';
+import { useState, type ChangeEvent, useRef, useEffect, useCallback } from 'react';
 import Image from 'next/image';
 import { analyzePsleProblem, type AnalyzePsleProblemOutput } from '@/ai/flows/analyze-psle-problem';
 import { addProblemToHistory } from '@/lib/local-storage';
@@ -11,75 +11,77 @@ import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Progress } from '@/components/ui/progress';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
-import { UploadCloud, AlertCircle, CheckCircle, Sparkles, Camera as CameraIcon, Video, XCircle } from 'lucide-react';
+import { UploadCloud, AlertCircle, CheckCircle, Sparkles, Camera as CameraIcon, Video, RefreshCcw, FileUp } from 'lucide-react';
 import ProblemDetailsCard from './problem-details-card';
 import { useToast } from "@/hooks/use-toast";
 
-export default function CaptureForm() {
-  const [imageFile, setImageFile] = useState<File | null>(null);
-  const [imagePreview, setImagePreview] = useState<string | null>(null);
-  const [analysisResult, setAnalysisResult] = useState<AnalyzedProblem | null>(null);
-  const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [error, setError] = useState<string | null>(null);
-  const { toast } = useToast();
+type UiMode = 'camera_pending' | 'camera_active' | 'camera_denied' | 'upload_mode' | 'analyzing' | 'results';
 
+export default function CaptureForm() {
+  const [uiMode, setUiMode] = useState<UiMode>('camera_pending');
+  const [imageFile, setImageFile] = useState<File | null>(null); // For potential direct use, though dataURI is primary
+  const [imagePreview, setImagePreview] = useState<string | null>(null); // Data URI
+  const [analysisResult, setAnalysisResult] = useState<AnalyzedProblem | null>(null);
+  const [analysisError, setAnalysisError] = useState<string | null>(null);
+  const [shouldAutoPlaySpeech, setShouldAutoPlaySpeech] = useState<boolean>(false);
+
+  const { toast } = useToast();
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const [isCameraOpen, setIsCameraOpen] = useState<boolean>(false);
-  const [hasCameraPermission, setHasCameraPermission] = useState<boolean | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const handleImageChange = (event: ChangeEvent<HTMLInputElement>) => {
-    const file = event.target.files?.[0];
-    if (file) {
-      setImageFile(file);
-      setAnalysisResult(null);
-      setError(null);
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        setImagePreview(reader.result as string);
-      };
-      reader.readAsDataURL(file);
-    } else {
-      setImageFile(null);
-      setImagePreview(null);
-    }
-  };
+  const [hasCameraPermissionInternal, setHasCameraPermissionInternal] = useState<boolean | null>(null);
 
-  const handleAnalyze = async () => {
-    if (!imagePreview && !imageFile) { // Check both as webcam might only set preview initially
-      setError("Please select or capture an image first.");
-      toast({
-        title: "No Image",
-        description: "Please upload or capture an image of the exam problem.",
-        variant: "destructive",
-      });
+  // Request camera permission and set up stream
+  const setupCamera = useCallback(async () => {
+    if (hasCameraPermissionInternal === true && videoRef.current?.srcObject) {
+      // Camera already set up and permission granted
+      setUiMode('camera_active');
       return;
     }
-    // Prefer imagePreview if available (e.g. from webcam), else use imageFile to generate preview
-    let imageDataUri = imagePreview;
-    if (!imageDataUri && imageFile) {
-      const reader = new FileReader();
-      reader.readAsDataURL(imageFile);
-      imageDataUri = await new Promise<string>((resolve) => {
-        reader.onloadend = () => resolve(reader.result as string);
+    setUiMode('camera_pending');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true });
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+      }
+      setHasCameraPermissionInternal(true);
+      setUiMode('camera_active');
+    } catch (error) {
+      console.error('Error accessing camera:', error);
+      setHasCameraPermissionInternal(false);
+      setUiMode('camera_denied');
+      toast({
+        variant: 'destructive',
+        title: 'Camera Access Denied',
+        description: 'Please enable camera permissions or use file upload.',
       });
-      setImagePreview(imageDataUri); // Set preview if it wasn't already
     }
+  }, [toast, hasCameraPermissionInternal]);
+
+  useEffect(() => {
+    // Attempt to set up camera on initial mount if no analysis result exists
+    if (!analysisResult && !imagePreview) {
+      setupCamera();
+    }
+    // Cleanup stream on unmount
+    return () => {
+      if (videoRef.current && videoRef.current.srcObject) {
+        const stream = videoRef.current.srcObject as MediaStream;
+        stream.getTracks().forEach(track => track.stop());
+        videoRef.current.srcObject = null;
+      }
+    };
+  }, [setupCamera, analysisResult, imagePreview]);
+
+
+  const runAnalysis = useCallback(async (imageDataUri: string) => {
+    setUiMode('analyzing');
+    setAnalysisError(null);
+    // analysisResult is cleared by handleStartOver or before new analysis
     
-    if (!imageDataUri) { // Final check
-        setError("Image data is missing.");
-        toast({ title: "Image Error", description: "Could not load image data for analysis.", variant: "destructive" });
-        return;
-    }
-
-
-    setIsLoading(true);
-    setError(null);
-    setAnalysisResult(null);
-
     try {
       const result: AnalyzePsleProblemOutput = await analyzePsleProblem({ problemImage: imageDataUri });
-      
       const newAnalyzedProblem: AnalyzedProblem = {
         id: new Date().toISOString(),
         problemImageUri: imageDataUri,
@@ -90,6 +92,7 @@ export default function CaptureForm() {
 
       setAnalysisResult(newAnalyzedProblem);
       addProblemToHistory(newAnalyzedProblem);
+      setUiMode('results');
       toast({
         title: "Analysis Complete!",
         description: "Problem analyzed and saved to history.",
@@ -98,88 +101,26 @@ export default function CaptureForm() {
     } catch (err) {
       console.error("Analysis failed:", err);
       const errorMessage = err instanceof Error ? err.message : "An unknown error occurred during analysis.";
-      setError(errorMessage);
+      setAnalysisError(errorMessage);
+      setUiMode(imagePreview ? 'camera_active' : 'upload_mode'); // Go back to appropriate mode before analysis
+      // If imagePreview exists, it means we were likely in camera_active or had an upload.
+      // If no imagePreview, means upload failed early or something unexpected.
+      setShouldAutoPlaySpeech(false); // Don't autoplay if analysis failed
       toast({
         title: "Analysis Failed",
         description: errorMessage,
         variant: "destructive",
       });
-    } finally {
-      setIsLoading(false);
     }
-  };
+  }, [toast]);
 
-  const handleToggleCamera = () => {
-    if (isCameraOpen) {
-      setIsCameraOpen(false);
-      // Stream cleanup is handled by useEffect's return function when isCameraOpen changes
-    } else {
-      setIsCameraOpen(true);
-      setImageFile(null);
-      setImagePreview(null);
-      setAnalysisResult(null);
-      setError(null);
-    }
-  };
-
-  useEffect(() => {
-    let currentStream: MediaStream | null = null;
-
-    const enableCameraStream = async () => {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ video: true });
-        currentStream = stream;
-        setHasCameraPermission(true);
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-        }
-      } catch (error) {
-        console.error('Error accessing camera:', error);
-        setHasCameraPermission(false);
-        toast({
-          variant: 'destructive',
-          title: 'Camera Access Denied',
-          description: 'Please enable camera permissions in your browser settings and try again.',
-        });
-      }
-    };
-
-    if (isCameraOpen) {
-      setHasCameraPermission(null); // Set to pending while requesting
-      enableCameraStream();
-    } else {
-      if (videoRef.current && videoRef.current.srcObject) {
-        const stream = videoRef.current.srcObject as MediaStream;
-        stream.getTracks().forEach(track => track.stop());
-        videoRef.current.srcObject = null;
-      }
-      setHasCameraPermission(null); // Reset permission status
-    }
-
-    return () => {
-      if (currentStream) {
-        currentStream.getTracks().forEach(track => track.stop());
-      }
-      // Ensure videoRef is also cleaned up if it somehow still holds a stream
-      if (videoRef.current && videoRef.current.srcObject) {
-        const stream = videoRef.current.srcObject as MediaStream;
-        stream.getTracks().forEach(track => track.stop());
-        videoRef.current.srcObject = null;
-      }
-    };
-  }, [isCameraOpen, toast]);
-
-  const handleTakePhoto = () => {
-    if (videoRef.current && canvasRef.current && hasCameraPermission) {
+  const handleSnapAnalyzeAndRead = async () => {
+    if (videoRef.current && canvasRef.current && hasCameraPermissionInternal) {
       const video = videoRef.current;
       const canvas = canvasRef.current;
 
       if (video.readyState < video.HAVE_METADATA || video.videoWidth === 0 || video.videoHeight === 0) {
-        toast({
-          title: "Camera Not Ready",
-          description: "Video stream has not loaded or has no dimensions. Please wait a moment and try again.",
-          variant: "default",
-        });
+        toast({ title: "Camera Not Ready", description: "Video stream has not loaded. Please wait and try again." });
         return;
       }
 
@@ -191,141 +132,186 @@ export default function CaptureForm() {
         const dataUrl = canvas.toDataURL('image/png');
         setImagePreview(dataUrl);
 
-        fetch(dataUrl)
-          .then(res => res.blob())
-          .then(blob => {
-            const file = new File([blob], "webcam-photo.png", { type: "image/png" });
-            setImageFile(file); // Set imageFile for consistency, though handleAnalyze uses imagePreview
-          });
-        handleToggleCamera(); // Close camera view
+        // Stop camera stream after taking photo
+        if (videoRef.current && videoRef.current.srcObject) {
+            const stream = videoRef.current.srcObject as MediaStream;
+            stream.getTracks().forEach(track => track.stop());
+            videoRef.current.srcObject = null;
+        }
+
+        fetch(dataUrl).then(res => res.blob()).then(blob => {
+          setImageFile(new File([blob], "webcam-photo.png", { type: "image/png" }));
+        });
+        
+        setShouldAutoPlaySpeech(true);
+        runAnalysis(dataUrl);
       }
     } else {
-      toast({
-        title: "Capture Error",
-        description: "Unable to take photo. Ensure camera is active and permission is granted.",
-        variant: "destructive",
-      });
+      toast({ title: "Capture Error", description: "Unable to snap photo.", variant: "destructive" });
     }
   };
 
+  const handleFileUpload = (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    if (file) {
+      setImageFile(file);
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const dataUrl = reader.result as string;
+        setImagePreview(dataUrl);
+        setShouldAutoPlaySpeech(false);
+        runAnalysis(dataUrl);
+      };
+      reader.readAsDataURL(file);
+    }
+     // Reset file input to allow uploading the same file again
+    if (fileInputRef.current) {
+        fileInputRef.current.value = "";
+    }
+  };
+
+  const handleStartOver = () => {
+    setAnalysisResult(null);
+    setImagePreview(null);
+    setImageFile(null);
+    setAnalysisError(null);
+    setShouldAutoPlaySpeech(false);
+    setHasCameraPermissionInternal(null); // This will trigger setupCamera via useEffect dependency if needed
+    // Explicitly call setupCamera to re-initiate camera attempt
+    setupCamera(); // This will set uiMode to camera_pending then active/denied
+  };
+
+  const switchToUploadMode = () => {
+    if (videoRef.current && videoRef.current.srcObject) {
+        const stream = videoRef.current.srcObject as MediaStream;
+        stream.getTracks().forEach(track => track.stop());
+        videoRef.current.srcObject = null;
+    }
+    setHasCameraPermissionInternal(false); // Effectively marks camera as not the go-to
+    setUiMode('upload_mode');
+  };
+
+
+  if (uiMode === 'results' && analysisResult) {
+    return (
+      <div className="w-full space-y-6">
+        <ProblemDetailsCard problem={analysisResult} autoPlaySpeech={shouldAutoPlaySpeech} />
+        <Button onClick={handleStartOver} variant="outline" className="w-full">
+          <RefreshCcw className="mr-2 h-5 w-5" />
+          Start Over
+        </Button>
+      </div>
+    );
+  }
+
+  if (uiMode === 'analyzing') {
+    return (
+      <div className="w-full space-y-4 text-center py-10">
+        <Sparkles className="mx-auto h-12 w-12 text-primary animate-spin" />
+        <p className="text-lg font-semibold text-primary">AI is working its magic...</p>
+        <Progress value={undefined} className="w-full h-2 animate-pulse" />
+        {imagePreview && (
+             <div className="mt-4 relative aspect-video w-full max-w-md mx-auto overflow-hidden rounded-lg border shadow-md">
+                <Image src={imagePreview} alt="Problem preview for analysis" layout="fill" objectFit="contain" data-ai-hint="exam question" />
+            </div>
+        )}
+      </div>
+    );
+  }
+
   return (
-    <div className="w-full space-y-8">
-      {!isCameraOpen && (
+    <div className="w-full space-y-6">
+      <canvas ref={canvasRef} className="hidden"></canvas>
+
+      {analysisError && (
+        <Alert variant="destructive" className="shadow-md">
+          <AlertCircle className="h-5 w-5" />
+          <AlertTitle>Analysis Error</AlertTitle>
+          <AlertDescription>{analysisError}</AlertDescription>
+        </Alert>
+      )}
+      
+      {(uiMode === 'camera_pending' || uiMode === 'camera_active' || (uiMode === 'camera_denied' && hasCameraPermissionInternal === null) ) && !imagePreview && (
+         <div className="space-y-4 p-6 border rounded-lg shadow-sm bg-card">
+            <h3 className="text-lg font-semibold text-center text-foreground">Webcam Capture</h3>
+            {uiMode === 'camera_pending' && (
+                <Alert variant="default" className="shadow-md">
+                    <AlertCircle className="h-5 w-5" />
+                    <AlertTitle>Initializing Camera</AlertTitle>
+                    <AlertDescription>
+                    Please allow camera access in your browser.
+                    </AlertDescription>
+                </Alert>
+            )}
+             <div className={`relative aspect-video w-full max-w-md mx-auto overflow-hidden rounded-lg border shadow-md bg-muted ${uiMode !== 'camera_active' ? 'flex items-center justify-center min-h-[200px]' : ''}`}>
+                <video ref={videoRef} className={`w-full h-full object-contain ${uiMode !== 'camera_active' ? 'hidden' : ''}`} autoPlay muted playsInline />
+                {uiMode === 'camera_pending' && <CameraIcon className="h-16 w-16 text-muted-foreground animate-pulse" />}
+             </div>
+
+            {uiMode === 'camera_active' && hasCameraPermissionInternal && (
+                <Button onClick={handleSnapAnalyzeAndRead} className="w-full text-lg py-6">
+                    <CameraIcon className="mr-2 h-5 w-5" />
+                    Snap, Analyze & Read Aloud
+                </Button>
+            )}
+            <Button onClick={switchToUploadMode} variant="outline" size="sm" className="w-full">
+                <FileUp className="mr-2 h-4 w-4" /> Use File Upload Instead
+            </Button>
+         </div>
+      )}
+
+      {(uiMode === 'upload_mode' || (uiMode === 'camera_denied' && hasCameraPermissionInternal === false)) && !imagePreview && (
         <div className="space-y-4 p-6 border border-dashed rounded-lg shadow-sm bg-card">
-          <Label htmlFor="problem-image" className="text-lg font-semibold text-center block text-foreground">
+            {uiMode === 'camera_denied' && hasCameraPermissionInternal === false && (
+                 <Alert variant="destructive" className="shadow-md">
+                    <AlertCircle className="h-5 w-5" />
+                    <AlertTitle>Camera Access Denied</AlertTitle>
+                    <AlertDescription>
+                    To use the webcam, please enable camera permissions in your browser settings and click "Start Over" or refresh the page. Otherwise, you can upload an image.
+                    </AlertDescription>
+                </Alert>
+            )}
+          <Label htmlFor="problem-image-upload" className="text-lg font-semibold text-center block text-foreground">
             Upload Exam Problem
           </Label>
           <Input
-            id="problem-image"
+            id="problem-image-upload"
+            ref={fileInputRef}
             type="file"
             accept="image/*"
-            onChange={handleImageChange}
+            onChange={handleFileUpload}
             className="file:text-primary file:font-semibold file:mr-2 hover:file:bg-primary/10"
             aria-describedby="image-help-text"
-            disabled={isLoading}
           />
           <p id="image-help-text" className="text-xs text-muted-foreground text-center">
-            Upload a clear picture of the exam problem.
+            Select a clear picture of the exam problem. Analysis will start automatically.
           </p>
-           <div className="relative flex py-3 items-center">
-            <div className="flex-grow border-t border-muted"></div>
-            <span className="flex-shrink mx-4 text-muted-foreground text-sm">OR</span>
-            <div className="flex-grow border-t border-muted"></div>
-          </div>
-          <Button onClick={handleToggleCamera} variant="outline" className="w-full" aria-label="Take Photo with Webcam" disabled={isLoading}>
-            <CameraIcon className="mr-2 h-5 w-5" />
-            Take Photo with Webcam
-          </Button>
+          {hasCameraPermissionInternal !== true && ( // Show option to try camera if not actively denied this session or if permission unknown
+            <Button onClick={handleStartOver} variant="outline" size="sm" className="w-full">
+                <CameraIcon className="mr-2 h-4 w-4" /> Try Webcam Again
+            </Button>
+          )}
         </div>
       )}
 
-      {isCameraOpen && (
-        <div className="space-y-4 p-6 border rounded-lg shadow-sm bg-card">
-          <h3 className="text-lg font-semibold text-center text-foreground">Webcam Capture</h3>
-          <div className="relative aspect-video w-full max-w-md mx-auto overflow-hidden rounded-lg border shadow-md bg-black">
-            <video ref={videoRef} className="w-full h-full object-contain" autoPlay muted playsInline />
-          </div>
-          <canvas ref={canvasRef} className="hidden"></canvas>
-
-          {hasCameraPermission === null && (
-             <Alert variant="default" className="shadow-md">
-                <AlertCircle className="h-5 w-5" />
-                <AlertTitle>Awaiting Camera Permission</AlertTitle>
-                <AlertDescription>
-                  Please allow camera access in your browser.
-                </AlertDescription>
-            </Alert>
-          )}
-          {hasCameraPermission === false && (
-             <Alert variant="destructive" className="shadow-md">
-                <AlertCircle className="h-5 w-5" />
-                <AlertTitle>Camera Access Denied</AlertTitle>
-                <AlertDescription>
-                  Enable camera permissions in browser settings and refresh if needed.
-                </AlertDescription>
-            </Alert>
-          )}
-
-          <div className="flex space-x-2 pt-2">
-            <Button onClick={handleTakePhoto} disabled={!hasCameraPermission || isLoading} className="flex-1" aria-label="Snap Photo">
-              <Video className="mr-2 h-5 w-5" />
-              Snap Photo
-            </Button>
-            <Button onClick={handleToggleCamera} variant="outline" className="flex-1" aria-label="Cancel Webcam">
-              <XCircle className="mr-2 h-5 w-5" />
-              Cancel
-            </Button>
-          </div>
-        </div>
-      )}
-
-      {imagePreview && !isCameraOpen && (
-        <div className="space-y-4">
-          <h3 className="text-lg font-semibold text-center text-foreground">Image Preview</h3>
+      {/* This image preview is mostly for when analysis is triggered and we want to show what's being analyzed,
+          or if analysis fails and user sees what they submitted.
+          The main display logic is handled by uiMode now.
+          This block might be redundant if 'analyzing' and 'results' views handle their own previews.
+          Let's keep it for debugging or potential brief display between states.
+      */}
+      {imagePreview && uiMode !== 'results' && uiMode !== 'analyzing' && (
+         <div className="space-y-4">
+          <h3 className="text-lg font-semibold text-center text-foreground">Selected Image</h3>
           <div className="relative aspect-video w-full max-w-md mx-auto overflow-hidden rounded-lg border shadow-md">
-            <Image src={imagePreview} alt="Problem preview" layout="fill" objectFit="contain" data-ai-hint="exam question" />
+            <Image src={imagePreview} alt="Problem preview" layout="fill" objectFit="contain" data-ai-hint="exam problem" />
           </div>
-        </div>
-      )}
-
-      {(imageFile || imagePreview) && !isCameraOpen && (
-        <Button
-          onClick={handleAnalyze}
-          disabled={isLoading}
-          className="w-full text-lg py-6 bg-primary hover:bg-primary/90 text-primary-foreground rounded-lg shadow-md"
-          aria-label="Analyze Problem"
-        >
-          {isLoading ? (
-            <Sparkles className="mr-2 h-5 w-5 animate-spin" />
-          ) : (
-            <UploadCloud className="mr-2 h-5 w-5" />
-          )}
-          {isLoading ? "Analyzing..." : "Analyze Problem"}
-        </Button>
-      )}
-
-      {isLoading && (
-        <div className="space-y-2">
-          <Progress value={undefined} className="w-full h-2 animate-pulse" />
-          <p className="text-sm text-center text-primary">AI is working its magic... please wait.</p>
-        </div>
-      )}
-
-      {error && (
-        <Alert variant="destructive" className="shadow-md">
-          <AlertCircle className="h-5 w-5" />
-          <AlertTitle>Error</AlertTitle>
-          <AlertDescription>{error}</AlertDescription>
-        </Alert>
-      )}
-
-      {analysisResult && !isCameraOpen && (
-        <div className="mt-8">
-          <ProblemDetailsCard problem={analysisResult} />
+           <Button onClick={handleStartOver} variant="outline" className="w-full">
+                <RefreshCcw className="mr-2 h-5 w-5" />
+                Clear and Restart
+            </Button>
         </div>
       )}
     </div>
   );
 }
-
-    

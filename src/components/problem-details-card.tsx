@@ -14,16 +14,27 @@ import { useToast } from '@/hooks/use-toast';
 type ProblemDetailsCardProps = {
   problem: AnalyzedProblem;
   showImage?: boolean;
+  autoPlaySpeech?: boolean; // New prop for automatic speech playback
 };
 
-export default function ProblemDetailsCard({ problem, showImage = true }: ProblemDetailsCardProps) {
+export default function ProblemDetailsCard({ problem, showImage = true, autoPlaySpeech = false }: ProblemDetailsCardProps) {
   const [isSpeaking, setIsSpeaking] = useState(false);
+  const [hasAutoPlayedForCurrentProblem, setHasAutoPlayedForCurrentProblem] = useState(false);
   const { toast } = useToast();
-  // utteranceRef is not strictly needed for basic play/stop if cancel() is always used globally,
-  // but can be useful if more granular control or direct reference to the utterance is needed later.
   const utteranceRef = useRef<SpeechSynthesisUtterance | null>(null);
 
-  const handleToggleSpeech = () => {
+  // Effect to reset auto-play state when the problem itself changes
+  useEffect(() => {
+    setHasAutoPlayedForCurrentProblem(false);
+    // Cancel any ongoing speech from a previous problem if component re-renders with new problem
+    if (typeof window !== 'undefined' && window.speechSynthesis && window.speechSynthesis.speaking) {
+      window.speechSynthesis.cancel();
+    }
+    // Ensure speaking state is also reset if problem changes while speaking (though cancel() should trigger onend)
+    setIsSpeaking(false); 
+  }, [problem.id]);
+
+  const speakAdvice = useCallback(() => {
     if (typeof window === 'undefined' || !window.speechSynthesis) {
       toast({
         title: "Speech Error",
@@ -33,58 +44,85 @@ export default function ProblemDetailsCard({ problem, showImage = true }: Proble
       return;
     }
 
-    if (isSpeaking) {
-      window.speechSynthesis.cancel(); // This should trigger the 'onend' event if speech was active
-      // setIsSpeaking(false); // onend will handle this
-    } else {
-      if (problem.advice && problem.advice.trim() !== "") {
-        const newUtterance = new SpeechSynthesisUtterance(problem.advice);
-        utteranceRef.current = newUtterance;
+    if (problem.advice && problem.advice.trim() !== "") {
+      // Cancel any existing speech before starting new
+      window.speechSynthesis.cancel();
+      
+      const newUtterance = new SpeechSynthesisUtterance(problem.advice);
+      utteranceRef.current = newUtterance;
 
-        newUtterance.onstart = () => {
-          setIsSpeaking(true);
-        };
-        newUtterance.onend = () => {
-          setIsSpeaking(false);
-          utteranceRef.current = null;
-        };
-        newUtterance.onerror = (event) => {
-          console.error("Speech synthesis error:", event);
-          setIsSpeaking(false);
-          utteranceRef.current = null;
-          toast({
-            title: "Speech Error",
-            description: "Could not read the advice aloud.",
-            variant: "destructive",
-          });
-        };
-        window.speechSynthesis.speak(newUtterance);
-      } else {
+      newUtterance.onstart = () => {
+        setIsSpeaking(true);
+      };
+      newUtterance.onend = () => {
+        setIsSpeaking(false);
+        utteranceRef.current = null;
+        // For autoPlay, mark it as done
+        if (autoPlaySpeech && !hasAutoPlayedForCurrentProblem) {
+            setHasAutoPlayedForCurrentProblem(true);
+        }
+      };
+      newUtterance.onerror = (event) => {
+        console.error("Speech synthesis error:", event);
+        setIsSpeaking(false);
+        utteranceRef.current = null;
+        if (autoPlaySpeech && !hasAutoPlayedForCurrentProblem) {
+            setHasAutoPlayedForCurrentProblem(true); // Mark as attempted
+        }
+        toast({
+          title: "Speech Error",
+          description: "Could not read the advice aloud.",
+          variant: "destructive",
+        });
+      };
+      window.speechSynthesis.speak(newUtterance);
+    } else if (autoPlaySpeech) {
+        // If autoPlay was true but no advice, mark as "done" for autoPlay logic
+        setHasAutoPlayedForCurrentProblem(true);
         toast({
           title: "No Advice",
           description: "There is no advice available to read.",
           variant: "default",
         });
+    }
+  }, [problem.advice, toast, autoPlaySpeech, hasAutoPlayedForCurrentProblem]);
+
+
+  // Effect for auto-playing speech
+  useEffect(() => {
+    if (autoPlaySpeech && problem.advice && !isSpeaking && !hasAutoPlayedForCurrentProblem) {
+      speakAdvice();
+    }
+  }, [autoPlaySpeech, problem.advice, isSpeaking, hasAutoPlayedForCurrentProblem, speakAdvice]);
+
+
+  const handleToggleSpeech = () => {
+    if (typeof window === 'undefined' || !window.speechSynthesis) {
+      toast({ title: "Speech Error", description: "Text-to-speech is not supported.", variant: "destructive" });
+      return;
+    }
+
+    if (isSpeaking) {
+      window.speechSynthesis.cancel(); // This should trigger 'onend'
+    } else {
+      if (problem.advice && problem.advice.trim() !== "") {
+        speakAdvice();
+      } else {
+         toast({ title: "No Advice", description: "No advice to read.", variant: "default" });
       }
     }
   };
 
+  // Cleanup function to stop speech synthesis when the component unmounts
   useEffect(() => {
-    // Cleanup function to stop speech synthesis when the component unmounts
-    // or when the problem prop changes (identified by problem.id).
     return () => {
       if (typeof window !== 'undefined' && window.speechSynthesis) {
-        // Check if speech was active for the current utterance and reset state if so.
-        // This ensures that if the component unmounts mid-speech, the state is correct.
-        if (utteranceRef.current && window.speechSynthesis.speaking) {
-            // It's good practice to cancel, though onend should handle state.
-        }
-        window.speechSynthesis.cancel(); 
-        setIsSpeaking(false); // Explicitly reset state on unmount or problem change
+        window.speechSynthesis.cancel();
         utteranceRef.current = null;
       }
     };
-  }, [problem.id]); // Add problem.id as a dependency
+  }, []);
+
 
   return (
     <Card className="w-full shadow-lg">
